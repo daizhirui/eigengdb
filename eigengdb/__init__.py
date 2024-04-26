@@ -6,6 +6,7 @@
 #
 # Copyright (C) 2009 Benjamin Schindler <bschindler@inf.ethz.ch>
 # Copyright (C) 2019 David Millard <dmillard@usc.edu>
+# Copyright (C) 2024 Zhirui Dai <zhdai@ucsd.edu>
 #
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -22,8 +23,10 @@
 #   that directory.
 # * Create a ~/.gdbinit file, that contains the following:
 #      python
-#      from printers import register_eigen_printers
-#      register_eigen_printers (None)
+#      import sys
+#      sys.path.insert(0, '/path/to/eigen/printer/directory')
+#      from eigengdb import register_eigen_printers
+#      register_eigen_printers(None)
 #      end
 
 import gdb
@@ -35,12 +38,12 @@ from bisect import bisect_left
 
 # Basic row/column iteration code for use with Sparse and Dense matrices
 class _MatrixEntryIterator(object):
-    def __init__(self, rows, cols, rowMajor):
+    def __init__(self, rows, cols, row_major):
         self.rows = rows
         self.cols = cols
         self.currentRow = 0
         self.currentCol = 0
-        self.rowMajor = rowMajor
+        self.rowMajor = row_major
 
     def __iter__(self):
         return self
@@ -55,51 +58,49 @@ class _MatrixEntryIterator(object):
             if self.currentCol >= self.cols:
                 raise StopIteration
 
-            self.currentRow = self.currentRow + 1
+            self.currentRow += 1
             if self.currentRow >= self.rows:
                 self.currentRow = 0
-                self.currentCol = self.currentCol + 1
+                self.currentCol += 1
         else:
             if self.currentRow >= self.rows:
                 raise StopIteration
 
-            self.currentCol = self.currentCol + 1
+            self.currentCol += 1
             if self.currentCol >= self.cols:
                 self.currentCol = 0
-                self.currentRow = self.currentRow + 1
+                self.currentRow += 1
 
-        return (row, col)
+        return row, col
 
 
 class EigenMatrixPrinter:
-    "Print Eigen Matrix or Array of some kind"
+    """Print Eigen Matrix or Array of some kind"""
 
     def __init__(self, variety, val):
-        "Extract all the necessary information"
+        """Extract all the necessary information"""
 
         # Save the variety (presumably "Matrix" or "Array") for later usage
         self.variety = variety
 
         # The gdb extension does not support value template arguments - need to extract them by hand
-        type = val.type
-        if type.code == gdb.TYPE_CODE_REF:
-            type = type.target()
-        self.type = type.unqualified().strip_typedefs()
+        typeinfo = val.type
+        if typeinfo.code == gdb.TYPE_CODE_REF:
+            typeinfo = typeinfo.target()
+        self.type = typeinfo.unqualified().strip_typedefs()
         tag = self.type.tag
-        regex = re.compile('\<.*\>')
+        regex = re.compile(r"<.*>")
         m = regex.findall(tag)[0][1:-1]
-        template_params = m.split(',')
+        template_params = m.split(",")
         template_params = [x.replace(" ", "") for x in template_params]
 
-        if template_params[1] == '-0x00000000000000001' or template_params[
-                1] == '-0x000000001' or template_params[1] == '-1':
-            self.rows = val['m_storage']['m_rows']
+        if template_params[1] in ["-0x00000000000000001", "-0x000000001", "-1"]:
+            self.rows = val["m_storage"]["m_rows"]
         else:
             self.rows = int(template_params[1])
 
-        if template_params[2] == '-0x00000000000000001' or template_params[
-                2] == '-0x000000001' or template_params[2] == '-1':
-            self.cols = val['m_storage']['m_cols']
+        if template_params[2] in ["-0x00000000000000001", "-0x000000001", "-1"]:
+            self.cols = val["m_storage"]["m_cols"]
         else:
             self.cols = int(template_params[2])
 
@@ -107,190 +108,199 @@ class EigenMatrixPrinter:
         if len(template_params) > 3:
             self.options = template_params[3]
 
-        self.rowMajor = (int(self.options) & 0x1)
+        self.rowMajor = int(self.options) & 0x1
 
         self.innerType = self.type.template_argument(0)
 
         self.val = val
 
         # Fixed size matrices have a struct as their storage, so we need to walk through this
-        self.data = self.val['m_storage']['m_data']
+        self.data = self.val["m_storage"]["m_data"]
         if self.data.type.code == gdb.TYPE_CODE_STRUCT:
-            self.data = self.data['array']
+            self.data = self.data["array"]
             self.data = self.data.cast(self.innerType.pointer())
 
-    class _iterator(_MatrixEntryIterator):
-        def __init__(self, rows, cols, dataPtr, rowMajor):
-            super(EigenMatrixPrinter._iterator,
-                  self).__init__(rows, cols, rowMajor)
+    class _Iterator(_MatrixEntryIterator):
+        def __init__(self, rows, cols, data_ptr, row_major):
+            super(EigenMatrixPrinter._Iterator, self).__init__(rows, cols, row_major)
 
-            self.dataPtr = dataPtr
+            self.dataPtr = data_ptr
 
         def __next__(self):
-
-            row, col = super(EigenMatrixPrinter._iterator, self).__next__()
+            row, col = super(EigenMatrixPrinter._Iterator, self).__next__()
 
             item = self.dataPtr.dereference()
-            self.dataPtr = self.dataPtr + 1
-            if (self.cols == 1):  #if it's a column vector
-                return ('[%d]' % (row, ), item)
-            elif (self.rows == 1):  #if it's a row vector
-                return ('[%d]' % (col, ), item)
-            return ('[%d,%d]' % (row, col), item)
+            self.dataPtr += 1
+            if self.cols == 1:  # if it's a column vector
+                return "[%d]" % (row,), item
+            elif self.rows == 1:  # if it's a row vector
+                return "[%d]" % (col,), item
+            return "[%d,%d]" % (row, col), item
+
+    # if defined, gdb will call this function to print the matrix element by element
+    # def children(self):
+    #     return self._Iterator(self.rows, self.cols, self.data, self.rowMajor)
 
     def to_string(self):
-        mat = np.zeros((self.rows, self.cols), dtype=np.float64)
-        for row in range(self.rows):
-            for col in range(self.cols):
-                if self.rowMajor:
-                    offset = row * self.cols + col
-                else:
-                    offset = col * self.rows + row
-                item = (self.data + offset).dereference()
-                try:
-                    # Basic stan-math support
-                    item['val']
-                    eval_string = "(*({}*)({})).val()".format(
-                        item.type, item.address)
-                    item = gdb.parse_and_eval(eval_string)
-                except (gdb.error):
-                    pass
-                try:
-                    # Basic CppAD support
-                    item['value_']
-                    eval_string = "(*({}*)({})).value_".format(
-                        item.type, item.address)
-                    item = gdb.parse_and_eval(eval_string)
-                except (gdb.error):
-                    pass
-                mat[row, col] = float(item)
+        try:
+            if self.rows * self.cols > 2 ** 24:  # memory cost is too high (you can adjust this number as needed)
+                raise Exception("Matrix too large to print as a numpy array.")
+            mat = np.zeros((self.rows, self.cols), dtype=np.float64)
+            for row in range(self.rows):
+                for col in range(self.cols):
+                    if self.rowMajor:
+                        offset = row * self.cols + col
+                    else:
+                        offset = col * self.rows + row
+                    item = (self.data + offset).dereference()
+                    try:
+                        # Basic stan-math support
+                        item["val"]
+                        eval_string = "(*({}*)({})).val()".format(item.type, item.address)
+                        item = gdb.parse_and_eval(eval_string)
+                    except gdb.error:
+                        pass
+                    try:
+                        # Basic CppAD support
+                        item["value_"]
+                        eval_string = "(*({}*)({})).value_".format(item.type, item.address)
+                        item = gdb.parse_and_eval(eval_string)
+                    except gdb.error:
+                        pass
+                    mat[row, col] = float(item)
 
-        return "Eigen::%s<%s,%d,%d,%s> (data ptr: %s)\n%s\n" % (
-            self.variety, self.innerType, self.rows, self.cols,
-            "RowMajor" if self.rowMajor else "ColMajor", self.data, mat)
+            return "Eigen::%s<%s,%d,%d,%s> (data ptr: %s)\n%s\n" % (
+                self.variety,
+                self.innerType,
+                self.rows,
+                self.cols,
+                "RowMajor" if self.rowMajor else "ColMajor",
+                self.data,
+                mat,
+            )
+        except Exception as e:
+            return "Eigen::%s<%s,%d,%d,%s> (data ptr: %s)" % (
+                self.variety,
+                self.innerType,
+                self.rows,
+                self.cols,
+                "RowMajor" if self.rowMajor else "ColMajor",
+                self.data,
+            )
 
 
 class EigenSparseMatrixPrinter:
-    "Print an Eigen SparseMatrix"
+    """Print an Eigen SparseMatrix"""
 
     def __init__(self, val):
-        "Extract all the necessary information"
+        """Extract all the necessary information"""
 
-        type = val.type
-        if type.code == gdb.TYPE_CODE_REF:
-            type = type.target()
-        self.type = type.unqualified().strip_typedefs()
+        typeinfo = val.type
+        if typeinfo.code == gdb.TYPE_CODE_REF:
+            typeinfo = typeinfo.target()
+        self.type = typeinfo.unqualified().strip_typedefs()
         tag = self.type.tag
-        regex = re.compile('\<.*\>')
+        regex = re.compile(r"<.*>")
         m = regex.findall(tag)[0][1:-1]
-        template_params = m.split(',')
+        template_params = m.split(",")
         template_params = [x.replace(" ", "") for x in template_params]
 
         self.options = 0
         if len(template_params) > 1:
             self.options = template_params[1]
 
-        self.rowMajor = (int(self.options) & 0x1)
+        self.rowMajor = int(self.options) & 0x1
 
         self.innerType = self.type.template_argument(0)
 
         self.val = val
 
-        self.data = self.val['m_data']
+        self.data = self.val["m_data"]
         self.data = self.data.cast(self.innerType.pointer())
 
-    class _iterator(_MatrixEntryIterator):
-        def __init__(self, rows, cols, val, rowMajor):
-            super(EigenSparseMatrixPrinter._iterator,
-                  self).__init__(rows, cols, rowMajor)
+    class _Iterator(_MatrixEntryIterator):
+        def __init__(self, rows, cols, val, row_major):
+            super(EigenSparseMatrixPrinter._Iterator, self).__init__(rows, cols, row_major)
 
             self.val = val
 
         def __next__(self):
-
-            row, col = super(EigenSparseMatrixPrinter._iterator,
-                             self).__next__()
+            row, col = super(EigenSparseMatrixPrinter._Iterator, self).__next__()
 
             # repeat calculations from SparseMatrix.h:
             outer = row if self.rowMajor else col
             inner = col if self.rowMajor else row
-            start = self.val['m_outerIndex'][outer]
-            end = ((start + self.val['m_innerNonZeros'][outer])
-                   if self.val['m_innerNonZeros'] else
-                   self.val['m_outerIndex'][outer + 1])
+            start = self.val["m_outerIndex"][outer]
+            end = (
+                (start + self.val["m_innerNonZeros"][outer])
+                if self.val["m_innerNonZeros"]
+                else self.val["m_outerIndex"][outer + 1]
+            )
 
             # and from CompressedStorage.h:
-            data = self.val['m_data']
+            data = self.val["m_data"]
             if start >= end:
                 item = 0
-            elif (end > start) and (inner == data['m_indices'][end - 1]):
-                item = data['m_values'][end - 1]
+            elif (end > start) and (inner == data["m_indices"][end - 1]):
+                item = data["m_values"][end - 1]
             else:
                 # create Python index list from the target range within m_indices
-                indices = [
-                    data['m_indices'][x] for x in range(int(start),
-                                                        int(end) - 1)
-                ]
+                indices = [data["m_indices"][x] for x in range(int(start), int(end) - 1)]
                 # find the index with binary search
                 idx = int(start) + bisect_left(indices, inner)
-                if ((idx < end) and (data['m_indices'][idx] == inner)):
-                    item = data['m_values'][idx]
+                if idx < end and data["m_indices"][idx] == inner:
+                    item = data["m_values"][idx]
                 else:
                     item = 0
 
-            return ('[%d,%d]' % (row, col), item)
+            return "[%d,%d]" % (row, col), item
 
     def children(self):
         if self.data:
-            return self._iterator(self.rows(), self.cols(), self.val,
-                                  self.rowMajor)
+            return self._Iterator(self.rows(), self.cols(), self.val, self.rowMajor)
 
         return iter([])  # empty matrix, for now
 
     def rows(self):
-        return self.val['m_outerSize'] if self.rowMajor else self.val[
-            'm_innerSize']
+        return self.val["m_outerSize"] if self.rowMajor else self.val["m_innerSize"]
 
     def cols(self):
-        return self.val['m_innerSize'] if self.rowMajor else self.val[
-            'm_outerSize']
+        return self.val["m_innerSize"] if self.rowMajor else self.val["m_outerSize"]
 
     def to_string(self):
 
         if self.data:
-            status = ("not compressed"
-                      if self.val['m_innerNonZeros'] else "compressed")
+            status = "not compressed" if self.val["m_innerNonZeros"] else "compressed"
         else:
             status = "empty"
         dimensions = "%d x %d" % (self.rows(), self.cols())
         layout = "row" if self.rowMajor else "column"
 
-        return "Eigen::SparseMatrix<%s>, %s, %s major, %s" % (
-            self.innerType, dimensions, layout, status)
+        return "Eigen::SparseMatrix<%s>, %s, %s major, %s" % (self.innerType, dimensions, layout, status)
 
 
 class EigenQuaternionPrinter:
-    "Print an Eigen Quaternion"
+    """Print an Eigen Quaternion"""
 
     def __init__(self, val):
-        "Extract all the necessary information"
+        """Extract all the necessary information"""
         # The gdb extension does not support value template arguments - need to extract them by hand
-        type = val.type
-        if type.code == gdb.TYPE_CODE_REF:
-            type = type.target()
-        self.type = type.unqualified().strip_typedefs()
+        typeinfo = val.type
+        if typeinfo.code == gdb.TYPE_CODE_REF:
+            typeinfo = typeinfo.target()
+        self.type = typeinfo.unqualified().strip_typedefs()
         self.innerType = self.type.template_argument(0)
         self.val = val
 
         # Quaternions have a struct as their storage, so we need to walk through this
-        self.data = self.val['m_coeffs']['m_storage']['m_data']['array']
+        self.data = self.val["m_coeffs"]["m_storage"]["m_data"]["array"]
         self.data = self.data.cast(self.innerType.pointer())
 
-    class _iterator:
-        def __init__(self, dataPtr):
-            self.dataPtr = dataPtr
+    class _Iterator:
+        def __init__(self, data_ptr):
+            self.dataPtr = data_ptr
             self.currentElement = 0
-            self.elementNames = ['x', 'y', 'z', 'w']
+            self.elementNames = ["x", "y", "z", "w"]
 
         def __iter__(self):
             return self
@@ -301,56 +311,69 @@ class EigenQuaternionPrinter:
         def __next__(self):
             element = self.currentElement
 
-            if self.currentElement >= 4:  #there are 4 elements in a quanternion
+            if self.currentElement >= 4:  # there are 4 elements in a quaternion
                 raise StopIteration
 
-            self.currentElement = self.currentElement + 1
+            self.currentElement += 1
 
             item = self.dataPtr.dereference()
-            self.dataPtr = self.dataPtr + 1
-            return ('[%s]' % (self.elementNames[element], ), item)
+            self.dataPtr += 1
+            return "[%s]" % (self.elementNames[element],), item
 
     def children(self):
-
-        return self._iterator(self.data)
+        return self._Iterator(self.data)
 
     def to_string(self):
-        return "Eigen::Quaternion<%s> (data ptr: %s)" % (self.innerType,
-                                                         self.data)
+        return "Eigen::Quaternion<%s> (data ptr: %s)" % (self.innerType, self.data)
+
+
+def cast_eigen_block_to_matrix(val):
+    # Get the type of the variable (and convert to a string)
+    # Example: 'const Eigen::Block<Eigen::Block<Eigen::Matrix<double, -1, -1, 0, -1, -1>, -1, -1, false> const, -1, -1, false>'
+    val_type = str(val.type)
+
+    # Extract the Eigen::Matrix type from the Block:
+    # From the previous example: Eigen::Matrix<double, -1, -1, 0, -1, -1>
+    begin = val_type.find("Eigen::Matrix<")
+    end = val_type.find(">", begin) + 1
+
+    # Convert the Eigen::Block to an Eigen::Matrix
+    return val.cast(gdb.lookup_type(val_type[begin:end]))
 
 
 def build_eigen_dictionary():
-    pretty_printers_dict[re.compile(
-        '^Eigen::Quaternion<.*>$')] = lambda val: EigenQuaternionPrinter(val)
-    pretty_printers_dict[re.compile(
-        '^Eigen::Matrix<.*>$')] = lambda val: EigenMatrixPrinter("Matrix", val)
-    pretty_printers_dict[re.compile(
-        '^Eigen::SparseMatrix<.*>$')] = lambda val: EigenSparseMatrixPrinter(val
-                                                                             )
-    pretty_printers_dict[re.compile(
-        '^Eigen::Array<.*>$')] = lambda val: EigenMatrixPrinter("Array", val)
+    pretty_printers_dict[re.compile("^Eigen::Quaternion<.*>$")] = lambda val: EigenQuaternionPrinter(val)
+    pretty_printers_dict[re.compile("^Eigen::Matrix<.*>$")] = lambda val: EigenMatrixPrinter("Matrix", val)
+    pretty_printers_dict[re.compile("^Eigen::Block<.*>$")] = lambda val: EigenMatrixPrinter(
+        "Matrix", cast_eigen_block_to_matrix(val)
+    )
+    pretty_printers_dict[re.compile("^Eigen::VectorBlock<.*>$")] = lambda val: EigenMatrixPrinter(
+        "Matrix", cast_eigen_block_to_matrix(val)
+    )
+    pretty_printers_dict[re.compile("^Eigen::SparseMatrix<.*>$")] = lambda val: EigenSparseMatrixPrinter(val)
+    pretty_printers_dict[re.compile("^Eigen::Array<.*>$")] = lambda val: EigenMatrixPrinter("Array", val)
 
 
 def register_eigen_printers(obj):
-    "Register eigen pretty-printers with objfile Obj"
+    """Register eigen pretty-printers with objfile Obj"""
 
-    if obj == None:
+    if obj is None:
         obj = gdb
     obj.pretty_printers.append(lookup_function)
 
 
 def lookup_function(val):
-    "Look-up and return a pretty-printer that can print va."
+    """Look-up and return a pretty-printer that can print val."""
 
-    type = val.type
+    typeinfo = val.type
 
-    if type.code == gdb.TYPE_CODE_REF:
-        type = type.target()
+    if typeinfo.code == gdb.TYPE_CODE_REF:
+        typeinfo = typeinfo.target()
 
-    type = type.unqualified().strip_typedefs()
+    typeinfo = typeinfo.unqualified().strip_typedefs()
 
-    typename = type.tag
-    if typename == None:
+    typename = typeinfo.tag
+    if typename is None:
         return None
 
     for function in pretty_printers_dict:
